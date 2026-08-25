@@ -164,3 +164,83 @@ func TestListAutopilots_DefaultExcludesArchived(t *testing.T) {
 		t.Fatalf("archived autopilot %s missing from status=archived list", archived)
 	}
 }
+
+// TestListAutopilots_SubscribersMatchDetail is the regression guard for
+// MUL-6680: GET /api/autopilots used to hard-code an empty subscriber slice to
+// avoid an N+1, which serialized as "subscribers": [] on every row. The key was
+// present and looked authoritative, so callers could not tell "no subscribers"
+// from "not fetched" — and the detail endpoint reported something different for
+// the very same autopilot. The two projections must now agree.
+func TestListAutopilots_SubscribersMatchDetail(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	agentID := createHandlerTestAgent(t, "autopilot-list-subs-agent", []byte(`[]`))
+	withSubs := insertListTestAutopilot(t, agentID, "list-subs-populated")
+	withoutSubs := insertListTestAutopilot(t, agentID, "list-subs-empty")
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO autopilot_subscriber (autopilot_id, user_type, user_id)
+		VALUES ($1, 'member', $2)
+	`, withSubs, testUserID); err != nil {
+		t.Fatalf("insert subscriber fixture: %v", err)
+	}
+
+	// list
+	w := httptest.NewRecorder()
+	testHandler.ListAutopilots(w, newRequest("GET", "/api/autopilots", nil))
+	if w.Code != 200 {
+		t.Fatalf("ListAutopilots: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var listBody struct {
+		Autopilots []map[string]any `json:"autopilots"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listBody); err != nil {
+		t.Fatalf("failed to decode list body: %v", err)
+	}
+	listRows := make(map[string]map[string]any)
+	for _, row := range listBody.Autopilots {
+		listRows[row["id"].(string)] = row
+	}
+
+	// detail, for the same autopilot at the same moment
+	w = httptest.NewRecorder()
+	testHandler.GetAutopilot(w, withURLParam(
+		newRequest("GET", "/api/autopilots/"+withSubs+"?workspace_id="+testWorkspaceID, nil), "id", withSubs))
+	if w.Code != 200 {
+		t.Fatalf("GetAutopilot: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var detailBody struct {
+		Autopilot map[string]any `json:"autopilot"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &detailBody); err != nil {
+		t.Fatalf("failed to decode detail body: %v", err)
+	}
+
+	fromList, _ := listRows[withSubs]["subscribers"].([]any)
+	fromDetail, _ := detailBody.Autopilot["subscribers"].([]any)
+	if len(fromDetail) != 1 {
+		t.Fatalf("detail subscribers: expected the seeded member, got %v", detailBody.Autopilot["subscribers"])
+	}
+	if len(fromList) != len(fromDetail) {
+		t.Errorf("list/detail disagree on subscribers: list=%v detail=%v", fromList, fromDetail)
+	}
+	if len(fromList) == 1 {
+		got, _ := fromList[0].(map[string]any)
+		if got["user_id"] != testUserID {
+			t.Errorf("list subscriber user_id: expected %s, got %v", testUserID, got["user_id"])
+		}
+	}
+
+	// An autopilot with genuinely no subscribers must still serialize the key
+	// as [] rather than omitting it — the field's documented contract, which
+	// only becomes trustworthy now that it is populated.
+	empty, ok := listRows[withoutSubs]["subscribers"]
+	if !ok {
+		t.Errorf("subscribers key must be present even when empty")
+	} else if entries, _ := empty.([]any); len(entries) != 0 {
+		t.Errorf("expected empty subscribers for %s, got %v", withoutSubs, empty)
+	}
+}
