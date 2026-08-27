@@ -865,7 +865,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			holdingPins := true
 			flushHeldPins := func() {
 				for _, held := range heldPins {
-					msgCh <- held
+					sendMessage(ctx, msgCh, held)
 				}
 				heldPins = nil
 				holdingPins = false
@@ -878,7 +878,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				if holdingPins {
 					flushHeldPins()
 				}
-				msgCh <- msg
+				sendMessage(ctx, msgCh, msg)
 			}
 			result, ok := <-session.Result
 			if !ok {
@@ -1135,7 +1135,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			if activity == "status:running" {
 				firstItemWait.start(time.Now())
 			}
-			trySend(msgCh, msg)
+			sendMessage(runCtx, msgCh, msg)
 			trySendString(semanticActivityCh, activity)
 			if activity != "" {
 				semanticObserved.Store(true)

@@ -226,21 +226,21 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			switch msg.Type {
 			case "assistant":
 				assistantEventCount++
-				turn := b.handleAssistant(msg, msgCh, usage)
+				turn := b.handleAssistant(runCtx, msg, msgCh, usage)
 				toolUseCount += turn.toolUses
 				if !turn.understood {
 					unreadableAssistantCount++
 				}
 				lastAssistantText = turn.resolveFallback(lastAssistantText)
 			case "user":
-				if b.handleUser(msg, msgCh) {
+				if b.handleUser(runCtx, msg, msgCh) {
 					sawAsyncLaunch = true
 				}
 			case "system":
 				if msg.SessionID != "" {
 					sessionID = msg.SessionID
 				}
-				trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
+				sendMessage(runCtx, msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 			case "result":
 				sawResult = true
 				finalResultText = msg.ResultText
@@ -253,7 +253,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				closeStdin()
 			case "log":
 				if msg.Log != nil {
-					trySend(msgCh, Message{
+					sendMessage(runCtx, msgCh, Message{
 						Type:    MessageLog,
 						Level:   msg.Log.Level,
 						Content: msg.Log.Message,
@@ -362,7 +362,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
-func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message, usage map[string]TokenUsage) assistantTurn {
+func (b *claudeBackend) handleAssistant(ctx context.Context, msg claudeSDKMessage, ch chan<- Message, usage map[string]TokenUsage) assistantTurn {
 	var content claudeMessageContent
 	if err := json.Unmarshal(msg.Message, &content); err != nil {
 		// Unreadable body: understood stays false so the caller drops any
@@ -388,11 +388,11 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 		case "text":
 			if block.Text != "" {
 				assistantText.WriteString(block.Text)
-				trySend(ch, Message{Type: MessageText, Content: block.Text})
+				sendMessage(ctx, ch, Message{Type: MessageText, Content: block.Text})
 			}
 		case "thinking":
 			if block.Text != "" {
-				trySend(ch, Message{Type: MessageThinking, Content: block.Text})
+				sendMessage(ctx, ch, Message{Type: MessageThinking, Content: block.Text})
 			}
 		case "tool_use":
 			toolUseCount++
@@ -400,7 +400,7 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 			if block.Input != nil {
 				_ = json.Unmarshal(block.Input, &input)
 			}
-			trySend(ch, Message{
+			sendMessage(ctx, ch, Message{
 				Type:   MessageToolUse,
 				Tool:   block.Name,
 				CallID: block.ID,
@@ -419,7 +419,7 @@ func (b *claudeBackend) handleAssistant(msg claudeSDKMessage, ch chan<- Message,
 	return turn
 }
 
-func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) bool {
+func (b *claudeBackend) handleUser(ctx context.Context, msg claudeSDKMessage, ch chan<- Message) bool {
 	var content claudeMessageContent
 	if err := json.Unmarshal(msg.Message, &content); err != nil {
 		return false
@@ -435,7 +435,7 @@ func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) bool
 					sawAsyncLaunch = true
 				}
 			}
-			trySend(ch, Message{
+			sendMessage(ctx, ch, Message{
 				Type:   MessageToolResult,
 				CallID: block.ToolUseID,
 				Output: resultStr,
@@ -679,17 +679,6 @@ type claudeControlRequestPayload struct {
 	Subtype  string          `json:"subtype"`
 	ToolName string          `json:"tool_name,omitempty"`
 	Input    json.RawMessage `json:"input,omitempty"`
-}
-
-// ── Shared helpers ──
-
-func trySend(ch chan<- Message, msg Message) {
-	select {
-	case ch <- msg:
-	default:
-		// Channel full — drop message. Result.Output is finalized independently,
-		// so only live transcript consumers are affected.
-	}
 }
 
 // claudeBlockedArgs are flags hardcoded by the daemon that must not be

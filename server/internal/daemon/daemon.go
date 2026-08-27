@@ -229,7 +229,8 @@ type terminalTaskReport struct {
 	// abandoned as unresumable (GH #6066). The server records it so no later
 	// run on the issue or chat can select it again, however many clean rows
 	// still reference it.
-	retiredSessionID string
+	retiredSessionID   string
+	expectedMessageSeq *int32
 }
 
 type executionEnvironmentCommand func() ([]string, error)
@@ -5508,6 +5509,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			durableWorkDir:        result.DurableWorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			expectedMessageSeq:    result.ExpectedMessageSeq,
 		})
 		if err == nil {
 			return
@@ -5551,6 +5553,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			failureReason:         taskfailure.Classify(fallbackErrMsg).String(),
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			expectedMessageSeq:    result.ExpectedMessageSeq,
 		}); failErr != nil {
 			taskLog.Error("fail task fallback also failed", "error", failErr)
 		}
@@ -5589,6 +5592,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			failureReason:         failureReason,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			expectedMessageSeq:    result.ExpectedMessageSeq,
 		}); err != nil {
 			taskLog.Error("report failed task failed", "error", err)
 		}
@@ -5606,9 +5610,9 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
+		return d.client.CompleteTaskWithTranscript(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.expectedMessageSeq)
 	case terminalTaskReportFail:
-		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
+		return d.client.FailTaskWithTranscript(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.expectedMessageSeq)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
@@ -7665,7 +7669,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Shared across the resume-retry below so the retry's transcript rows
 	// keep ascending seq values for the same task.
 	var msgSeq atomic.Int32
-	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+	defer func() {
+		if returnErr == nil {
+			expected := msgSeq.Load()
+			taskResult.ExpectedMessageSeq = &expected
+		}
+	}()
+	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq, task.TranscriptBatchReplaySafe)
 	if err != nil {
 		return TaskResult{}, err
 	}
@@ -7719,7 +7729,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 		freshPrompt := BuildPrompt(task, provider, promptOptions...)
 
-		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+		retryResult, retryTools, retryErr := d.executeAndDrain(ctx, backend, freshPrompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq, task.TranscriptBatchReplaySafe)
 		if retryErr != nil {
 			taskLog.Error("fresh session also failed to start; keeping the original poisoned result", "error", retryErr)
 		} else if retryResult.Status != "completed" && retryResult.SessionID == "" {
@@ -8168,7 +8178,12 @@ func freshSessionMayHelp(errText string) bool {
 // messages and is owned by the caller so a same-task retry continues the
 // sequence instead of restarting at 1 — the server orders the transcript by
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
-func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
+var (
+	transcriptDrainGrace       = 10 * time.Second
+	transcriptDrainStopTimeout = 12 * time.Second
+)
+
+func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32, transcriptBatchReplaySafe ...bool) (agent.Result, int32, error) {
 	// Wrap the caller's ctx so the idle watchdog (below) can interrupt both
 	// the agent subprocess (via the ctx passed to backend.Execute) AND the
 	// drain loop with a single cancel. Without this layer the backend would
@@ -8176,6 +8191,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// drain, leaving the subprocess running.
 	agentCtx, agentCancel := context.WithCancel(ctx)
 	defer agentCancel()
+	agentCtx, deliveryTracker := agent.WithMessageDeliveryTracker(agentCtx)
 
 	session, err := backend.Execute(agentCtx, prompt, opts)
 	if err != nil {
@@ -8246,6 +8262,10 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// message batch, so the result hand-off below can wait for the transcript
 	// tail to be persisted.
 	drainFinished := make(chan struct{})
+	forceDrainStop := make(chan struct{})
+	var drainTruncated atomic.Bool
+	var transcriptErrMu sync.Mutex
+	var transcriptErr error
 	go func() {
 		defer close(drainFinished)
 		var mu sync.Mutex
@@ -8280,8 +8300,24 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 
 			if len(toSend) > 0 {
 				sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := d.client.ReportTaskMessages(sendCtx, taskID, toSend); err != nil {
-					taskLog.Debug("failed to report task messages", "error", err)
+				var err error
+				if len(transcriptBatchReplaySafe) > 0 && transcriptBatchReplaySafe[0] {
+					err = d.client.ReportTaskMessagesWithRetry(sendCtx, taskID, toSend)
+				} else {
+					err = d.client.ReportTaskMessages(sendCtx, taskID, toSend)
+				}
+				if err != nil {
+					transcriptErrMu.Lock()
+					if transcriptErr == nil {
+						transcriptErr = err
+					}
+					transcriptErrMu.Unlock()
+					taskLog.Warn("failed to report task messages after retries",
+						"error", err,
+						"count", len(toSend),
+						"first_seq", toSend[0].Seq,
+						"last_seq", toSend[len(toSend)-1].Seq,
+					)
 				} else {
 					taskLog.Debug("reported task messages", "count", len(toSend), "last_seq", toSend[len(toSend)-1].Seq)
 				}
@@ -8439,7 +8475,8 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					})
 					mu.Unlock()
 				}
-			case <-drainCtx.Done():
+			case <-forceDrainStop:
+				drainTruncated.Store(true)
 				goto drainDone
 			}
 		}
@@ -8458,26 +8495,40 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// terminal transition would otherwise see a transcript that is non-empty
 	// but truncated, indistinguishable from a complete one. Bounded so a
 	// backend that never closes its message channel cannot stall the terminal
-	// transition: after 10s the drain loop is cancelled and given a window
+	// transition: after 10s the drain loop is force-stopped and given a window
 	// wide enough for its worst-case exit — an in-flight tick flush plus the
 	// final one, each capped by the 5s ReportTaskMessages timeout and neither
 	// interruptible by the cancel (they post on context.Background()).
-	waitForDrain := func() {
+	waitForDrain := func() error {
 		select {
 		case <-drainFinished:
-		case <-time.After(10 * time.Second):
-			drainCancel()
+		case <-time.After(transcriptDrainGrace):
+			close(forceDrainStop)
 			select {
 			case <-drainFinished:
-			case <-time.After(12 * time.Second):
-				taskLog.Warn("transcript drain did not stop after cancel; completing anyway")
+			case <-time.After(transcriptDrainStopTimeout):
+				return errors.New("transcript drain did not stop after cancellation")
 			}
 		}
+		transcriptErrMu.Lock()
+		defer transcriptErrMu.Unlock()
+		if transcriptErr != nil {
+			return fmt.Errorf("transcript delivery failed: %w", transcriptErr)
+		}
+		if drainTruncated.Load() {
+			return errors.New("transcript drain was force-stopped before the message stream closed")
+		}
+		if deliveryTracker.Abandoned() {
+			return errors.New("transcript delivery abandoned during agent cancellation")
+		}
+		return nil
 	}
 
 	select {
 	case result := <-session.Result:
-		waitForDrain()
+		if err := waitForDrain(); err != nil {
+			return result, toolCount.Load(), err
+		}
 		if idleWatchdogFired.Load() {
 			// The backend's wait goroutine (e.g. claude.go) translates the
 			// SIGKILL we delivered via agentCancel into Status="aborted".
@@ -8491,11 +8542,12 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		}
 		return result, toolCount.Load(), nil
 	case <-drainCtx.Done():
-		// The drain loop is exiting on this same Done signal; wait for its
-		// final flush so the timeout/watchdog/cancel terminals below cannot
-		// hand back (and let runTask fail-and-broadcast) a still-flushing
-		// transcript either.
-		waitForDrain()
+		// Backend cancellation may race with buffered terminal messages. Keep
+		// draining until the backend closes Messages, then flush before handing
+		// back; waitForDrain fails closed if that close never arrives.
+		if err := waitForDrain(); err != nil {
+			return agent.Result{}, toolCount.Load(), err
+		}
 		// Idle watchdog cancels via agentCancel(), which propagates here as
 		// context.Canceled. Check this BEFORE the generic cancelled/timeout
 		// classifiers so a watchdog-induced stop isn't misreported as

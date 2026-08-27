@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -170,15 +172,260 @@ func TestReportTaskMessagesPublishesInSeqOrder(t *testing.T) {
 	}
 }
 
+func TestReportTaskMessagesReplayIsIdempotent(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "batch-replay")
+
+	sharedBus := testHandler.Bus
+	testHandler.Bus = events.New()
+	t.Cleanup(func() { testHandler.Bus = sharedBus })
+
+	var mu sync.Mutex
+	published := 0
+	testHandler.Bus.Subscribe(protocol.EventTaskMessage, func(e events.Event) {
+		if e.TaskID == taskID {
+			mu.Lock()
+			published++
+			mu.Unlock()
+		}
+	})
+
+	messages := []any{
+		map[string]any{"seq": 1, "type": "tool_use", "tool": "exec", "input": map[string]any{"cmd": "true", "nested": map[string]any{"ok": true}}},
+		map[string]any{"seq": 2, "type": "text", "content": "second"},
+	}
+	for range 2 {
+		testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, messages)).Want(http.StatusOK)
+	}
+
+	if count := dbfx.Count(t, `SELECT COUNT(*) FROM task_message WHERE task_id = $1`, taskID); count != 2 {
+		t.Fatalf("persisted rows = %d, want 2", count)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if published != 2 {
+		t.Fatalf("published events = %d, want 2 (replay must publish none)", published)
+	}
+}
+
+func TestReportTaskMessagesRejectsConflictingReplayAtomically(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "batch-conflicting-replay")
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "original"},
+	})).Want(http.StatusOK)
+
+	// The new seq must roll back with the altered replay; accepting only the
+	// new row would turn one rejected batch into a partial transcript.
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "tool_use", "tool": "exec", "content": "altered"},
+		map[string]any{"seq": 2, "type": "text", "content": "must roll back"},
+	})).Want(http.StatusConflict)
+
+	stored, err := testHandler.Queries.ListTaskMessages(context.Background(), util.MustParseUUID(taskID))
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(stored) != 1 || stored[0].Type != "text" || stored[0].Content.String != "original" {
+		t.Fatalf("conflicting replay changed transcript: %+v", stored)
+	}
+}
+
+func TestReportTaskMessagesRejectsInvalidBatchSeq(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "batch-invalid-seq")
+
+	tests := []struct {
+		name     string
+		messages []any
+	}{
+		{"zero", []any{map[string]any{"seq": 0, "type": "text", "content": "bad"}}},
+		{"overflow", []any{map[string]any{"seq": 2147483648, "type": "text", "content": "bad"}}},
+		{"duplicate", []any{
+			map[string]any{"seq": 1, "type": "text", "content": "first"},
+			map[string]any{"seq": 1, "type": "text", "content": "different"},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, tt.messages)).Want(http.StatusBadRequest)
+		})
+	}
+	if count := dbfx.Count(t, `SELECT COUNT(*) FROM task_message WHERE task_id = $1`, taskID); count != 0 {
+		t.Fatalf("persisted rows = %d, want 0", count)
+	}
+}
+
+func TestCompleteTaskRequiresContiguousTranscriptReceipt(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	taskID := seedBatchTask(t, "terminal-transcript-receipt")
+
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "first"},
+		map[string]any{"seq": 3, "type": "text", "content": "third"},
+	})).Want(http.StatusOK)
+
+	complete := func() *http.Request {
+		return daemonTaskRequest(t, "/api/daemon/tasks/"+taskID+"/complete", taskID, map[string]any{
+			"output":               "done",
+			"expected_message_seq": 3,
+		})
+	}
+	w := testutil.Call(t, testHandler.CompleteTask, complete()).Want(http.StatusInternalServerError)
+	if !strings.Contains(w.Body.String(), "transcript incomplete") {
+		t.Fatalf("missing receipt error: %s", w.Body.String())
+	}
+
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task after rejected completion: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("status after rejected completion = %q, want running", status)
+	}
+
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 2, "type": "text", "content": "second"},
+	})).Want(http.StatusOK)
+	testutil.Call(t, testHandler.CompleteTask, complete()).Want(http.StatusOK)
+	// A lost HTTP response makes the daemon replay the exact terminal callback.
+	// The sealed receipt must make that retry idempotent, while a different
+	// terminal payload must not be mistaken for the same completion.
+	testutil.Call(t, testHandler.CompleteTask, complete()).Want(http.StatusOK)
+	testutil.Call(t, testHandler.CompleteTask, daemonTaskRequest(t,
+		"/api/daemon/tasks/"+taskID+"/complete", taskID, map[string]any{
+			"output": "different", "expected_message_seq": 3,
+		})).Want(http.StatusInternalServerError)
+
+	var resultJSON []byte
+	if err := testPool.QueryRow(ctx, `SELECT status, result FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status, &resultJSON); err != nil {
+		t.Fatalf("read completed task: %v", err)
+	}
+	if status != "completed" {
+		t.Fatalf("status = %q, want completed", status)
+	}
+	var result TaskCompleteRequest
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if !result.TranscriptComplete || result.ExpectedMessageSeq == nil || *result.ExpectedMessageSeq != 3 {
+		t.Fatalf("transcript receipt = %+v, want complete at seq 3", result)
+	}
+}
+
+func TestCompleteTaskReceiptRejectsLateTranscriptWrite(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "terminal-transcript-seal")
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "only"},
+	})).Want(http.StatusOK)
+	testutil.Call(t, testHandler.CompleteTask, daemonTaskRequest(t,
+		"/api/daemon/tasks/"+taskID+"/complete", taskID, map[string]any{
+			"output": "done", "expected_message_seq": 1,
+		})).Want(http.StatusOK)
+
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 2, "type": "text", "content": "late"},
+	})).Want(http.StatusConflict)
+	if count := dbfx.Count(t, `SELECT COUNT(*) FROM task_message WHERE task_id = $1`, taskID); count != 1 {
+		t.Fatalf("late write changed sealed transcript row count to %d", count)
+	}
+}
+
+func TestReportTaskMessagesAcceptsCancelledTaskFinalDrain(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	taskID := seedBatchTask(t, "cancelled-transcript-final-drain")
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'cancelled' WHERE id = $1`, taskID)
+
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "final drain"},
+	})).Want(http.StatusOK)
+	if count := dbfx.Count(t, `SELECT COUNT(*) FROM task_message WHERE task_id = $1`, taskID); count != 1 {
+		t.Fatalf("cancelled task final drain persisted %d rows, want 1", count)
+	}
+}
+
+func TestCompleteTaskAcceptsEmptyTranscriptReceipt(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	emptyTaskID := seedBatchTask(t, "empty-transcript-receipt")
+	testutil.Call(t, testHandler.CompleteTask, daemonTaskRequest(t,
+		"/api/daemon/tasks/"+emptyTaskID+"/complete", emptyTaskID, map[string]any{
+			"output": "done", "expected_message_seq": 0,
+		})).Want(http.StatusOK)
+
+	nonemptyTaskID := seedBatchTask(t, "invalid-empty-transcript-receipt")
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, nonemptyTaskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "present"},
+	})).Want(http.StatusOK)
+	testutil.Call(t, testHandler.CompleteTask, daemonTaskRequest(t,
+		"/api/daemon/tasks/"+nonemptyTaskID+"/complete", nonemptyTaskID, map[string]any{
+			"output": "done", "expected_message_seq": 0,
+		})).Want(http.StatusInternalServerError)
+}
+
+func TestFailTaskRequiresContiguousTranscriptReceipt(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	taskID := seedBatchTask(t, "failed-transcript-receipt")
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 2, "type": "text", "content": "second"},
+	})).Want(http.StatusOK)
+
+	fail := func() *http.Request {
+		return daemonTaskRequest(t, "/api/daemon/tasks/"+taskID+"/fail", taskID, map[string]any{
+			"error":                "agent failed",
+			"failure_reason":       "agent_error.unknown",
+			"expected_message_seq": 2,
+		})
+	}
+	testutil.Call(t, testHandler.FailTask, fail()).Want(http.StatusInternalServerError)
+
+	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
+		map[string]any{"seq": 1, "type": "text", "content": "first"},
+	})).Want(http.StatusOK)
+	testutil.Call(t, testHandler.FailTask, fail()).Want(http.StatusOK)
+	testutil.Call(t, testHandler.FailTask, fail()).Want(http.StatusOK)
+	testutil.Call(t, testHandler.FailTask, daemonTaskRequest(t,
+		"/api/daemon/tasks/"+taskID+"/fail", taskID, map[string]any{
+			"error": "different", "failure_reason": "agent_error.unknown", "expected_message_seq": 2,
+		})).Want(http.StatusInternalServerError)
+	testutil.Call(t, testHandler.FailTask, daemonTaskRequest(t,
+		"/api/daemon/tasks/"+taskID+"/fail", taskID, map[string]any{
+			"error": "agent failed", "failure_reason": "agent_error.unknown", "expected_message_seq": 2,
+			"session_rollout_missing": true,
+		})).Want(http.StatusInternalServerError)
+
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read failed task: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("status = %q, want failed", status)
+	}
+}
+
 // TestCreateTaskMessagesBatchIsAtomic exercises the production query, not a copy
 // of it: a batch that violates the primary key must persist nothing. This is the
-// property the single statement buys over the per-message loop, which could
-// leave a prefix of the batch behind and no way to complete it (the daemon does
-// not retry this endpoint).
-//
-// Note what this does and does not guarantee: the batch is consistent, not
-// complete. A failing batch is now lost whole. Closing that gap needs a retry
-// plus a (task_id, seq) uniqueness rule, which is not part of this change.
+// property the single statement buys over the per-message loop. Delivery
+// completeness is covered separately by retry, (task_id, seq) uniqueness and
+// the terminal contiguous-sequence receipt.
 func TestCreateTaskMessagesBatchIsAtomic(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
