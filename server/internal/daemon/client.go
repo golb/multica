@@ -494,7 +494,17 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 	}, nil)
 }
 
+func (c *Client) ReportTaskMessagesWithRetry(ctx context.Context, taskID string, messages []TaskMessageData) error {
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), map[string]any{
+		"messages": messages,
+	}, nil, taskMessageRetrySchedule)
+}
+
 func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
+	return c.CompleteTaskWithTranscript(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, nil)
+}
+
+func (c *Client) CompleteTaskWithTranscript(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expectedMessageSeq *int32) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -514,6 +524,9 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, s
 	if retiredSessionID != "" {
 		body["retired_session_id"] = retiredSessionID
 	}
+	if expectedMessageSeq != nil {
+		body["expected_message_seq"] = *expectedMessageSeq
+	}
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, defaultTerminalRetrySchedule)
 }
 
@@ -527,6 +540,10 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 }
 
 func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
+	return c.FailTaskWithTranscript(ctx, taskID, errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, nil)
+}
+
+func (c *Client) FailTaskWithTranscript(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expectedMessageSeq *int32) error {
 	body := map[string]any{"error": errMsg}
 	if sessionID != "" {
 		body["session_id"] = sessionID
@@ -551,6 +568,9 @@ func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDi
 	}
 	if retiredSessionID != "" {
 		body["retired_session_id"] = retiredSessionID
+	}
+	if expectedMessageSeq != nil {
+		body["expected_message_seq"] = *expectedMessageSeq
 	}
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), body, nil, defaultTerminalRetrySchedule)
 }
@@ -993,6 +1013,16 @@ var defaultTerminalRetrySchedule = []time.Duration{
 	16 * time.Second,
 	32 * time.Second,
 	64 * time.Second,
+}
+
+// taskMessageRetrySchedule is deliberately shorter than the terminal callback
+// schedule: transcript batches are emitted throughout a run, so a long outage
+// must fail the task instead of stacking minutes of blocked flushes. Replays
+// are safe because the server de-duplicates each message by (task_id, seq).
+var taskMessageRetrySchedule = []time.Duration{
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
 }
 
 // skillBundleResolveRetrySchedule rides out brief transport blips on a single
