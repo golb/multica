@@ -3467,14 +3467,18 @@ type idleWatchdogBackend struct {
 	emitOne bool // when true, emit one message before going silent; when false, never emit anything
 }
 
-func (b idleWatchdogBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+func (b idleWatchdogBackend) Execute(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
 	msgCh := make(chan agent.Message, 1)
 	resCh := make(chan agent.Result)
 	if b.emitOne {
 		msgCh <- agent.Message{Type: agent.MessageText, Content: "hello"}
 	}
-	// Deliberately do NOT close msgCh and never write to resCh — this models
-	// a backend whose subprocess is hung and will never naturally complete.
+	// The subprocess is hung and never completes naturally, but a real backend
+	// still closes Messages after executeAndDrain cancels its process context.
+	go func() {
+		<-ctx.Done()
+		close(msgCh)
+	}()
 	return &agent.Session{Messages: msgCh, Result: resCh}, nil
 }
 
@@ -3815,11 +3819,14 @@ func TestExecuteAndDrain_IdleWatchdog_PerRunOverrideStillUsesToolWindow(t *testi
 // (the MUL-3064 default), AgentToolWatchdog is the only thing that ends it.
 type stuckInFlightToolBackend struct{}
 
-func (stuckInFlightToolBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+func (stuckInFlightToolBackend) Execute(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
 	msgCh := make(chan agent.Message, 2)
 	resCh := make(chan agent.Result)
 	msgCh <- agent.Message{Type: agent.MessageToolUse, Tool: "Bash", CallID: "c1"}
-	// Deliberately leave msgCh open, never emit tool_result, never write resCh.
+	go func() {
+		<-ctx.Done()
+		close(msgCh)
+	}()
 	return &agent.Session{Messages: msgCh, Result: resCh}, nil
 }
 
@@ -3854,12 +3861,15 @@ func TestExecuteAndDrain_IdleWatchdog_FiresOnStuckInFlightTool(t *testing.T) {
 // fresh; the watchdog should fire exactly one window later, not earlier.
 type tailIdleAfterToolBackend struct{}
 
-func (tailIdleAfterToolBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+func (tailIdleAfterToolBackend) Execute(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
 	msgCh := make(chan agent.Message, 4)
 	resCh := make(chan agent.Result)
 	msgCh <- agent.Message{Type: agent.MessageToolUse, Tool: "Bash", CallID: "c1"}
 	msgCh <- agent.Message{Type: agent.MessageToolResult, Tool: "Bash", CallID: "c1", Output: "ok"}
-	// Deliberately leave msgCh open and never write to resCh.
+	go func() {
+		<-ctx.Done()
+		close(msgCh)
+	}()
 	return &agent.Session{Messages: msgCh, Result: resCh}, nil
 }
 
