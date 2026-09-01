@@ -5441,6 +5441,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	case <-cancelledByPoll:
 		taskLog.Info("task cancelled during execution, discarding result",
 			"branch_name", result.BranchName, "error", err)
+		if errors.Is(err, errTranscriptIncomplete) {
+			taskLog.Error("cancelled task transcript is incomplete; withholding flush acknowledgement", "error", err)
+			return
+		}
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
 		// (#5219). The sweeper grace period covers a lost ack's chat settle,
@@ -8616,6 +8620,7 @@ func freshSessionMayHelp(errText string) bool {
 var (
 	transcriptDrainGrace       = 10 * time.Second
 	transcriptDrainStopTimeout = 12 * time.Second
+	errTranscriptIncomplete    = errors.New("transcript delivery incomplete")
 )
 
 func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32, transcriptBatchReplaySafe ...bool) (agent.Result, int32, error) {
@@ -8734,7 +8739,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 			mu.Unlock()
 
 			if len(toSend) > 0 {
-				sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				sendCtx, cancel := context.WithTimeout(context.Background(), taskMessageDeliveryTimeout)
 				var err error
 				if len(transcriptBatchReplaySafe) > 0 && transcriptBatchReplaySafe[0] {
 					err = d.client.ReportTaskMessagesWithRetry(sendCtx, taskID, toSend)
@@ -8948,13 +8953,13 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		transcriptErrMu.Lock()
 		defer transcriptErrMu.Unlock()
 		if transcriptErr != nil {
-			return fmt.Errorf("transcript delivery failed: %w", transcriptErr)
+			return fmt.Errorf("%w: transcript delivery failed: %v", errTranscriptIncomplete, transcriptErr)
 		}
 		if drainTruncated.Load() {
-			return errors.New("transcript drain was force-stopped before the message stream closed")
+			return fmt.Errorf("%w: transcript drain was force-stopped before the message stream closed", errTranscriptIncomplete)
 		}
 		if deliveryTracker.Abandoned() {
-			return errors.New("transcript delivery abandoned during agent cancellation")
+			return fmt.Errorf("%w: transcript delivery abandoned during agent cancellation", errTranscriptIncomplete)
 		}
 		return nil
 	}

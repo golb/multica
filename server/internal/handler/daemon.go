@@ -3796,6 +3796,19 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// same commit creates and wakes can never observe the withheld pointer or a
 	// missing continuity-gap flag.
 	task, err := h.TaskService.CompleteTaskWithTranscript(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir, req.ExpectedMessageSeq)
+	if errors.Is(err, service.ErrTaskTranscriptIncomplete) {
+		h.failTask(w, r, taskID, workspaceID, TaskFailRequest{
+			Error:                 err.Error(),
+			FailureReason:         taskfailure.ReasonTranscriptIncomplete.String(),
+			SessionID:             req.SessionID,
+			WorkDir:               req.WorkDir,
+			DurableWorkDir:        req.DurableWorkDir,
+			BranchName:            req.BranchName,
+			SessionRolloutMissing: req.SessionRolloutMissing,
+			RetiredSessionID:      req.RetiredSessionID,
+		})
+		return
+	}
 	if err != nil {
 		// A CompleteTask error is an infrastructure failure (transaction /
 		// assistant-outcome write), not a bad request: an already-finalized
@@ -3804,6 +3817,10 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 		// including the single chat outcome row — lands exactly once (MUL-4351).
 		slog.Warn("complete task failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if task.Status == "failed" && task.FailureReason.Valid && task.FailureReason.String == taskfailure.ReasonTranscriptIncomplete.String() {
+		writeJSON(w, http.StatusOK, map[string]string{"status": task.Status})
 		return
 	}
 
@@ -4493,6 +4510,12 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 	// creates and wakes the auto-retry, so the retry can never claim the withheld
 	// pointer or miss the continuity gap.
 	task, err := h.TaskService.FailTaskWithTranscript(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir, req.ExpectedMessageSeq)
+	if errors.Is(err, service.ErrTaskTranscriptIncomplete) {
+		req.Error = err.Error()
+		req.FailureReason = taskfailure.ReasonTranscriptIncomplete.String()
+		req.ExpectedMessageSeq = nil
+		task, err = h.TaskService.FailTaskWithTranscript(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir, nil)
+	}
 	if err != nil {
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the
@@ -4504,6 +4527,10 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 		slog.Warn("fail task failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if task.FailureReason.Valid && task.FailureReason.String == taskfailure.ReasonTranscriptIncomplete.String() {
+		req.Error = task.Error.String
+		req.FailureReason = task.FailureReason.String
 	}
 	h.TaskService.NotifyTaskFinished(*task)
 

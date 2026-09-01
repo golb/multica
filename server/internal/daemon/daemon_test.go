@@ -2495,8 +2495,21 @@ func TestExecuteAndDrain_FailsWhenTranscriptRetriesExhausted(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "transcript delivery failed") {
 		t.Fatalf("executeAndDrain error = %v, want transcript delivery failure", err)
 	}
-	if got := calls.Load(); got != int32(len(taskMessageRetrySchedule)+1) {
-		t.Fatalf("message attempts = %d, want %d", got, len(taskMessageRetrySchedule)+1)
+	if !errors.Is(err, errTranscriptIncomplete) {
+		t.Fatalf("executeAndDrain error = %v, want incomplete-transcript classification", err)
+	}
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("message attempts = %d, want 4", got)
+	}
+	var backoffBudget time.Duration
+	for _, delay := range taskMessageRetrySchedule {
+		backoffBudget += delay
+	}
+	if backoffBudget != 1750*time.Millisecond {
+		t.Fatalf("message retry backoff budget = %s, want 1.75s", backoffBudget)
+	}
+	if backoffBudget >= taskMessageDeliveryTimeout {
+		t.Fatalf("message retry backoff budget %s consumes 5s delivery deadline", backoffBudget)
 	}
 }
 
@@ -2519,6 +2532,9 @@ func TestExecuteAndDrain_FailsWhenMessageStreamNeverCloses(t *testing.T) {
 	_, _, err := d.executeAndDrain(context.Background(), backend, "p", agent.ExecOptions{}, slog.Default(), "task-open-stream", "", new(atomic.Int32))
 	if err == nil || !strings.Contains(err.Error(), "force-stopped before the message stream closed") {
 		t.Fatalf("executeAndDrain error = %v, want force-stopped transcript failure", err)
+	}
+	if !errors.Is(err, errTranscriptIncomplete) {
+		t.Fatalf("executeAndDrain error = %v, want incomplete-transcript classification", err)
 	}
 	if got := rec.snapshot(); len(got) != 1 || got[0].Content != "persist before refusing receipt" {
 		t.Fatalf("persisted transcript before refusing receipt = %+v", got)
@@ -4834,6 +4850,7 @@ func TestHandleTask_ReportsUsageWhenCancelledByPoll(t *testing.T) {
 	// statusCallCount lets the poll goroutine return "cancelled" on first call
 	// while still handling later calls from the post-run status check.
 	var statusCallCount atomic.Int64
+	var cancelAckCalls atomic.Int32
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -4857,6 +4874,9 @@ func TestHandleTask_ReportsUsageWhenCancelledByPoll(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{"status":"running"}`))
 			}
+		case strings.HasSuffix(r.URL.Path, "/cancel-ack"):
+			cancelAckCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -4880,7 +4900,7 @@ func TestHandleTask_ReportsUsageWhenCancelledByPoll(t *testing.T) {
 			Usage: []TaskUsageEntry{
 				{Provider: "anthropic", Model: "claude-opus-4-6", InputTokens: 200, OutputTokens: 80},
 			},
-		}, nil
+		}, fmt.Errorf("%w: injected cancellation-path gap", errTranscriptIncomplete)
 	})
 
 	task := Task{
@@ -4921,6 +4941,9 @@ func TestHandleTask_ReportsUsageWhenCancelledByPoll(t *testing.T) {
 	// given that the runner blocks on runCtx.Done().
 	if usageIdx < pollStatusIdx {
 		t.Fatalf("usage reported before poll-status (order: %v) — poll-status must come first", order)
+	}
+	if got := cancelAckCalls.Load(); got != 0 {
+		t.Fatalf("cancel acknowledgements = %d, want 0 for incomplete transcript", got)
 	}
 }
 

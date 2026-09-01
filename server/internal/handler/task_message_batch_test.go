@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // seedBatchTask builds the running, issue-backed task the /messages endpoint
@@ -262,7 +262,7 @@ func TestReportTaskMessagesRejectsInvalidBatchSeq(t *testing.T) {
 	}
 }
 
-func TestCompleteTaskRequiresContiguousTranscriptReceipt(t *testing.T) {
+func TestCompleteTaskFinalizesIncompleteTranscriptAsFailure(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -280,45 +280,20 @@ func TestCompleteTaskRequiresContiguousTranscriptReceipt(t *testing.T) {
 			"expected_message_seq": 3,
 		})
 	}
-	w := testutil.Call(t, testHandler.CompleteTask, complete()).Want(http.StatusInternalServerError)
-	if !strings.Contains(w.Body.String(), "transcript incomplete") {
-		t.Fatalf("missing receipt error: %s", w.Body.String())
-	}
-
-	var status string
-	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
-		t.Fatalf("read task after rejected completion: %v", err)
-	}
-	if status != "running" {
-		t.Fatalf("status after rejected completion = %q, want running", status)
-	}
-
-	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
-		map[string]any{"seq": 2, "type": "text", "content": "second"},
-	})).Want(http.StatusOK)
 	testutil.Call(t, testHandler.CompleteTask, complete()).Want(http.StatusOK)
-	// A lost HTTP response makes the daemon replay the exact terminal callback.
-	// The sealed receipt must make that retry idempotent, while a different
-	// terminal payload must not be mistaken for the same completion.
+	// A lost response replays the original completion callback. Once the
+	// transcript gap has been persisted as a terminal failure, that replay is
+	// idempotent rather than returning 5xx forever.
 	testutil.Call(t, testHandler.CompleteTask, complete()).Want(http.StatusOK)
-	testutil.Call(t, testHandler.CompleteTask, daemonTaskRequest(t,
-		"/api/daemon/tasks/"+taskID+"/complete", taskID, map[string]any{
-			"output": "different", "expected_message_seq": 3,
-		})).Want(http.StatusInternalServerError)
 
-	var resultJSON []byte
-	if err := testPool.QueryRow(ctx, `SELECT status, result FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status, &resultJSON); err != nil {
-		t.Fatalf("read completed task: %v", err)
+	var status, taskErr, failureReason string
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, error, failure_reason FROM agent_task_queue WHERE id = $1
+	`, taskID).Scan(&status, &taskErr, &failureReason); err != nil {
+		t.Fatalf("read task after incomplete completion: %v", err)
 	}
-	if status != "completed" {
-		t.Fatalf("status = %q, want completed", status)
-	}
-	var result TaskCompleteRequest
-	if err := json.Unmarshal(resultJSON, &result); err != nil {
-		t.Fatalf("decode result: %v", err)
-	}
-	if !result.TranscriptComplete || result.ExpectedMessageSeq == nil || *result.ExpectedMessageSeq != 3 {
-		t.Fatalf("transcript receipt = %+v, want complete at seq 3", result)
+	if status != "failed" || failureReason != taskfailure.ReasonTranscriptIncomplete.String() || !strings.Contains(taskErr, "transcript incomplete") {
+		t.Fatalf("terminal task = status %q error %q reason %q", status, taskErr, failureReason)
 	}
 }
 
@@ -375,10 +350,10 @@ func TestCompleteTaskAcceptsEmptyTranscriptReceipt(t *testing.T) {
 	testutil.Call(t, testHandler.CompleteTask, daemonTaskRequest(t,
 		"/api/daemon/tasks/"+nonemptyTaskID+"/complete", nonemptyTaskID, map[string]any{
 			"output": "done", "expected_message_seq": 0,
-		})).Want(http.StatusInternalServerError)
+		})).Want(http.StatusOK)
 }
 
-func TestFailTaskRequiresContiguousTranscriptReceipt(t *testing.T) {
+func TestFailTaskFinalizesIncompleteTranscriptAsFailure(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -395,29 +370,18 @@ func TestFailTaskRequiresContiguousTranscriptReceipt(t *testing.T) {
 			"expected_message_seq": 2,
 		})
 	}
-	testutil.Call(t, testHandler.FailTask, fail()).Want(http.StatusInternalServerError)
-
-	testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, []any{
-		map[string]any{"seq": 1, "type": "text", "content": "first"},
-	})).Want(http.StatusOK)
 	testutil.Call(t, testHandler.FailTask, fail()).Want(http.StatusOK)
+	// Retry the exact callback to cover a lost successful HTTP response.
 	testutil.Call(t, testHandler.FailTask, fail()).Want(http.StatusOK)
-	testutil.Call(t, testHandler.FailTask, daemonTaskRequest(t,
-		"/api/daemon/tasks/"+taskID+"/fail", taskID, map[string]any{
-			"error": "different", "failure_reason": "agent_error.unknown", "expected_message_seq": 2,
-		})).Want(http.StatusInternalServerError)
-	testutil.Call(t, testHandler.FailTask, daemonTaskRequest(t,
-		"/api/daemon/tasks/"+taskID+"/fail", taskID, map[string]any{
-			"error": "agent failed", "failure_reason": "agent_error.unknown", "expected_message_seq": 2,
-			"session_rollout_missing": true,
-		})).Want(http.StatusInternalServerError)
 
-	var status string
-	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+	var status, taskErr, failureReason string
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, error, failure_reason FROM agent_task_queue WHERE id = $1
+	`, taskID).Scan(&status, &taskErr, &failureReason); err != nil {
 		t.Fatalf("read failed task: %v", err)
 	}
-	if status != "failed" {
-		t.Fatalf("status = %q, want failed", status)
+	if status != "failed" || failureReason != taskfailure.ReasonTranscriptIncomplete.String() || !strings.Contains(taskErr, "transcript incomplete") {
+		t.Fatalf("terminal task = status %q error %q reason %q", status, taskErr, failureReason)
 	}
 }
 

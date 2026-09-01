@@ -1015,10 +1015,12 @@ var defaultTerminalRetrySchedule = []time.Duration{
 	64 * time.Second,
 }
 
-// taskMessageRetrySchedule is deliberately shorter than the terminal callback
-// schedule: transcript batches are emitted throughout a run, so a long outage
-// must fail the task instead of stacking minutes of blocked flushes. Replays
+// taskMessageRetrySchedule spends at most 1.75s sleeping inside the existing
+// 5s transcript-delivery deadline. That leaves 3.25s for four fast-failing
+// requests while bounding every flush at the same 5s latency ceiling. Replays
 // are safe because the server de-duplicates each message by (task_id, seq).
+const taskMessageDeliveryTimeout = 5 * time.Second
+
 var taskMessageRetrySchedule = []time.Duration{
 	250 * time.Millisecond,
 	500 * time.Millisecond,

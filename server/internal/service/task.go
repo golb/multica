@@ -4259,6 +4259,10 @@ func failedTerminalPayloadMatches(existing db.AgentTaskQueue, errMsg, sessionID,
 		optionalTerminalTextMatches(existing.DurableWorkDir, durableWorkDir)
 }
 
+// ErrTaskTranscriptIncomplete marks a terminal callback whose claimed final
+// sequence cannot be verified against the stored contiguous transcript.
+var ErrTaskTranscriptIncomplete = errors.New("transcript incomplete")
+
 func verifyTaskTranscript(ctx context.Context, qtx *db.Queries, taskID pgtype.UUID, expectedMessageSeq *int32) error {
 	if expectedMessageSeq == nil {
 		return nil // Legacy daemon: completeness remains unknown.
@@ -4281,8 +4285,13 @@ func verifyTaskTranscript(ctx context.Context, qtx *db.Queries, taskID pgtype.UU
 	if err != nil {
 		return fmt.Errorf("read transcript sequence summary: %w", err)
 	}
-	return fmt.Errorf("transcript incomplete: expected contiguous seq 1..%d, got count=%d min=%d max=%d",
+	return fmt.Errorf("%w: expected contiguous seq 1..%d, got count=%d min=%d max=%d", ErrTaskTranscriptIncomplete,
 		*expectedMessageSeq, summary.MessageCount, summary.MinSeq, summary.MaxSeq)
+}
+
+func failedForIncompleteTranscript(task db.AgentTaskQueue) bool {
+	return task.Status == "failed" && task.FailureReason.Valid &&
+		task.FailureReason.String == taskfailure.ReasonTranscriptIncomplete.String()
 }
 
 // CompleteTask marks a task as completed.
@@ -4389,6 +4398,9 @@ func (s *TaskService) CompleteTaskWithTranscript(ctx context.Context, taskID pgt
 		// Treat it as an idempotent success — same pattern as CancelTask.
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			idempotent := expectedMessageSeq == nil && errors.Is(err, pgx.ErrNoRows)
+			if expectedMessageSeq != nil && failedForIncompleteTranscript(existing) {
+				idempotent = true
+			}
 			if expectedMessageSeq != nil && existing.Status == "completed" && jsonPayloadEqual(existing.Result, result) {
 				matches, matchErr := taskTranscriptMatches(ctx, s.Queries, taskID, *expectedMessageSeq)
 				idempotent = matchErr == nil && matches
@@ -5007,6 +5019,9 @@ func (s *TaskService) FailTaskWithTranscript(ctx context.Context, taskID pgtype.
 	}); err != nil {
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			idempotent := expectedMessageSeq == nil && errors.Is(err, pgx.ErrNoRows)
+			if expectedMessageSeq != nil && failedForIncompleteTranscript(existing) {
+				idempotent = true
+			}
 			if expectedMessageSeq != nil && failedTerminalPayloadMatches(existing,
 				errMsg, sessionID, workDir, branchName, failureReason,
 				sessionRolloutMissing, retiredSessionID, durableWorkDir) {
